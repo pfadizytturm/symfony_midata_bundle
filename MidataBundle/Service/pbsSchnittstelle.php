@@ -378,12 +378,26 @@ class pbsSchnittstelle extends PfadiZytturmMidataBundle
         return $list;
     }
 
+    /**
+     * Resolve the current picture URL for a Midata person.
+     *
+     * Midata stores profile images behind short-lived signed URLs. When such a
+     * URL is already expired we reload the person resource once and cache that
+     * refresh with the remaining TTL. Missing image metadata is treated as
+     * "no image" so callers do not emit warnings for incomplete person payloads.
+     *
+     * @param array $person Midata person payload
+     * @return string picture URL or an empty string if none is available
+     */
     public function load_image($person)
     {
-        $url = $person["picture"];
+        $url = $person["picture"] ?? '';
+        if ($url === '') {
+            return '';
+        }
 
         $query = parse_url($url, PHP_URL_QUERY);
-        if($query !== "")
+        if(is_string($query) && $query !== "")
         {
             $arr = [];
             parse_str($query, $arr);
@@ -396,12 +410,14 @@ class pbsSchnittstelle extends PfadiZytturmMidataBundle
 
                 if($now > $date + $ttl)
                 {
-                    $person = $this->queryWrap($person["href"], use_cache: true, cacheKey: strval($person["id"]) . "_bild", ttl: $ttl);
+                    if (isset($person["href"], $person["id"])) {
+                        $person = $this->queryWrap($person["href"], use_cache: true, cacheKey: strval($person["id"]) . "_bild", ttl: $ttl);
+                    }
                 }
             }
         }
 
-        return $person["picture"];
+        return $person["picture"] ?? '';
     }
 
     /**
@@ -415,6 +431,13 @@ class pbsSchnittstelle extends PfadiZytturmMidataBundle
      * @return array result of person queries of matching persons
      *
      * Search for users.
+     *
+     * Midata payloads are not always structurally complete. In practice, linked
+     * groups, roles, email references or phone references may be missing for
+     * single records even when the overall request succeeds. This method keeps
+     * the legacy "best effort" behaviour, but normalises these missing nested
+     * fields to empty values so one malformed record does not empty the whole
+     * result set for contact or organigram pages.
      */
     public function loadMembersOfGroupWithFilter($group, $filter, $inklusiveUntergruppen, $inklusiveAPVundERinUntergruppen = false, $nurVersanAdressen = false, $nurUntergruppen = false, $removeDuplicates = true, $use_cache = true)
     {
@@ -423,6 +446,9 @@ class pbsSchnittstelle extends PfadiZytturmMidataBundle
 
         // get the list of members of the current group
         $memberlist = $this->requestGroupMembers($group, $use_cache);
+        if (!is_array($memberlist)) {
+            return array();
+        }
 
 
         $mailadressen = array();
@@ -436,17 +462,27 @@ class pbsSchnittstelle extends PfadiZytturmMidataBundle
 
         try {
             // return if list is empty
-            if (count($memberlist['people']) == 0) {
+            if (!isset($memberlist['people']) || !is_array($memberlist['people']) || count($memberlist['people']) == 0) {
                 return array();
             }
 
+            // Midata may omit linked collections for partial records, so treat
+            // missing sections as empty lists instead of failing the whole load.
             // list the child groups
-            foreach ($memberlist['linked']['groups'] as $g) {
+            foreach (($memberlist['linked']['groups'] ?? array()) as $g) {
+                if (!isset($g["id"], $g["name"])) {
+                    continue;
+                }
+
                 $groupsList[$g["id"]] = $g["name"];
             }
 
             // do the role based filtering
-            foreach ($memberlist['linked']['roles'] as $role) {
+            foreach (($memberlist['linked']['roles'] ?? array()) as $role) {
+                if (!isset($role['id'], $role['role_type'])) {
+                    continue;
+                }
+
                 $mask[$role['id']] = (
                     $filter == 'Alle' or
                     $filter == '' or
@@ -462,8 +498,12 @@ class pbsSchnittstelle extends PfadiZytturmMidataBundle
                 );
 
                 $rolesList[$role["id"]]["Rolle"] = $role["role_type"];
-                $rolesList[$role["id"]]["Label"] = $role["label"];
-                $rolesList[$role["id"]]["Gruppe"] = $groupsList[$role["links"]["group"]];
+                $rolesList[$role["id"]]["Label"] = $role["label"] ?? '';
+
+                $groupId = $role["links"]["group"] ?? null;
+                $rolesList[$role["id"]]["Gruppe"] = ($groupId !== null && isset($groupsList[$groupId]))
+                    ? $groupsList[$groupId]
+                    : '';
             }
 
             // resolve the links for mail addresses and phone numbers
@@ -495,10 +535,16 @@ class pbsSchnittstelle extends PfadiZytturmMidataBundle
                 // asemble the output list
                 foreach ($memberlist['people'] as $member) {
                     $filtered = false;
-                    foreach ($member['links']['roles'] as $role) {
-                        if ($mask[$role]) {
+                    // Some person payloads do not expose any role links; those
+                    // entries are simply skipped because they cannot match.
+                    foreach (($member['links']['roles'] ?? array()) as $role) {
+                        if (($mask[$role] ?? false)) {
                             $filtered = true;
-                            $member["Rollen"] = $rolesList[$role];
+                            $member["Rollen"] = $rolesList[$role] ?? array(
+                                'Rolle' => '',
+                                'Label' => '',
+                                'Gruppe' => ''
+                            );
                             break;
                         }
                     }
@@ -510,6 +556,10 @@ class pbsSchnittstelle extends PfadiZytturmMidataBundle
                     $member['Versandadressen'] = array();
                     if (isset($member['links']['additional_emails'])) {
                         foreach ($member['links']['additional_emails'] as $mail) {
+                            if (!isset($mailadressen[$mail])) {
+                                continue;
+                            }
+
                             $member["e" . $mailadressen[$mail]['label']] = $mailadressen[$mail]['mail'];
                             if ($mailadressen[$mail]['versand']) {
                                 $member['Versandadressen'][] = $mailadressen[$mail]['mail'];
@@ -517,12 +567,16 @@ class pbsSchnittstelle extends PfadiZytturmMidataBundle
                         }
                     }
 
-                    if ($member['email']) {
+                    if (!empty($member['email'])) {
                         $member['Versandadressen'][] = $member['email'];
                     }
 
                     if (isset($member['links']['phone_numbers'])) {
                         foreach ($member['links']['phone_numbers'] as $telefon) {
+                            if (!isset($telefonNummern[$telefon])) {
+                                continue;
+                            }
+
                             $member["t" . $telefonNummern[$telefon]['label']] = $telefonNummern[$telefon]['nummer'];
                         }
                     }
@@ -563,6 +617,8 @@ class pbsSchnittstelle extends PfadiZytturmMidataBundle
             }
             return $lst;
         } catch (\Exception $e) {
+            // Preserve the historical contract of this service: callers receive
+            // an empty list when a Midata subtree cannot be assembled.
             return array();
         }
     }
